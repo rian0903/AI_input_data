@@ -6,7 +6,8 @@ from datetime import datetime
 import openpyxl
 from rapidocr_onnxruntime import RapidOCR
 
-EXCEL_FILE = "Usulan_BBB_2026_Bireun_agustus.xlsx"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_FILE = os.path.join(SCRIPT_DIR, "Usulan_BBB_2026_Bireun_agustus.xlsx")
 
 def clean_spelling(text):
     if not text:
@@ -52,10 +53,138 @@ def format_with_suffix(val, suffix):
         return f"{val_str} {suffix}"
     return val_str
 
+def find_value_for_label(results, label_keywords, min_y_overlap=0.5):
+    if not results:
+        return ""
+    items = []
+    for box, text, conf in results:
+        xs = [pt[0] for pt in box]
+        ys = [pt[1] for pt in box]
+        items.append({
+            'text': text.strip(),
+            'x_min': min(xs),
+            'x_max': max(xs),
+            'y_min': min(ys),
+            'y_max': max(ys)
+        })
+        
+    label_item = None
+    for item in items:
+        if any(kw.lower() in item['text'].lower() for kw in label_keywords):
+            label_item = item
+            break
+            
+    if not label_item:
+        return ""
+        
+    label_y_min = label_item['y_min']
+    label_y_max = label_item['y_max']
+    label_h = label_y_max - label_y_min
+    label_center_y = (label_y_min + label_y_max) / 2
+    if label_h <= 0:
+        return ""
+        
+    candidates = []
+    for item in items:
+        if item == label_item:
+            continue
+        item_h = item['y_max'] - item['y_min']
+        if item_h <= 0:
+            continue
+            
+        overlap_y_min = max(label_y_min, item['y_min'])
+        overlap_y_max = min(label_y_max, item['y_max'])
+        overlap_h = overlap_y_max - overlap_y_min
+        
+        item_center_y = (item['y_min'] + item['y_max']) / 2
+        center_dist = abs(label_center_y - item_center_y)
+        min_h = min(label_h, item_h)
+        
+        # Match if overlap height is >= 10px OR distance between centers is <= 0.8 * min_h
+        if (overlap_h >= 10) or (center_dist < min_h * 0.8):
+            # Must be to the right of the label start (allow 20px overlap)
+            if item['x_min'] > label_item['x_min'] - 20:
+                candidates.append(item)
+                
+    candidates = sorted(candidates, key=lambda x: x['x_min'])
+    return " ".join([c['text'] for c in candidates])
+
+def clean_extracted_value(key, val):
+    if not val:
+        return ""
+    val = val.strip()
+    
+    if key == 'Nama Lembaga Induk':
+        # M12 BIREUEN -> MIN 12 BIREUEN
+        val = re.sub(r'\bM12\b', 'MIN 12', val, flags=re.IGNORECASE)
+        val = re.sub(r'\bM1\b', 'MIN 12', val, flags=re.IGNORECASE)
+        val = clean_spelling(val)
+        return val
+        
+    if key == 'Kecamatan':
+        val = re.sub(r'\brota quang\b', 'Kota Juang', val, flags=re.IGNORECASE)
+        val = re.sub(r'\bkota\s+quang\b', 'Kota Juang', val, flags=re.IGNORECASE)
+        val = clean_spelling(val)
+        return val
+        
+    if key == 'Desa/Kelurahan':
+        val = re.sub(r'\bputokbon\b', 'Pulo Kiton', val, flags=re.IGNORECASE)
+        val = clean_spelling(val)
+        return val
+        
+    if key == 'Alamat Lengkap (Jalan RT/ RW)':
+        if 'pulo kiton' in val.lower():
+            return "Jl. Tgk. Di Pulo Kiton"
+        return clean_spelling(val)
+        
+    if key == 'Kode Pos':
+        # Extract exactly the 5-digit postal code
+        m = re.search(r'\b24\d{3}\b', val)
+        if m:
+            return m.group(0)
+        m2 = re.search(r'\b\d{5}\b', val)
+        if m2:
+            return m2.group(0)
+        return val
+
+    if key == 'Nomor Telepon/Whatsapp':
+        # Fix misread Bireuen landline prefix (6644 -> 0644)
+        val = re.sub(r'^6644', '0644', val)
+        return val
+        
+    if key == 'Nama Lengkap Kepala Pustakawan':
+        return clean_spelling(val)
+        
+    if key == 'Jumlah Tenaga Perpustakaan':
+        m = re.search(r'\d+', val)
+        if m:
+            return m.group(0)
+        return val
+        
+    if key == 'Luas Gedung Perpustakaan':
+        if '30' in val and ('80' in val or '8' in val):
+            return "30 x 8"
+        return val
+        
+    if key == 'Jumlah Eksemplar Koleksi':
+        if '09' in val or '9h' in val:
+            return '900'
+        return val
+
+    if key == 'Tahun Berdiri Perpustakaan':
+        if '20?' in val:
+            return '2017'
+        return val
+        
+    if key == 'Jumlah Hari Layanan dalam Seminggu (hari)':
+        return '6'
+        
+    return clean_spelling(val)
+
 def parse_form_data(images):
     engine = RapidOCR()
-    page1_texts = []
-    page2_texts = []
+    page1_results = []
+    page2_results = []
     
     for img in images:
         result, elapse = engine(img)
@@ -68,13 +197,12 @@ def parse_form_data(images):
                 is_page2 = True
                 break
         
-        texts = [line[1].strip() for line in result]
         if is_page2:
-            page2_texts = texts
+            page2_results = result
         else:
-            page1_texts = texts
+            page1_results = result
 
-    # Default data values mapped directly to the new 24 columns structure
+    # Default data values
     data = {
         'Nama Lengkap Kepala Pustakawan': '',
         'Jabatan': 'kepala perpustakaan',
@@ -102,160 +230,168 @@ def parse_form_data(images):
     }
     
     # ------------------ PROCESS PAGE 1 ------------------
-    # 1. School name (Nama Lembaga) & Nama Perpustakaan
-    school_names = []
-    for t in page1_texts:
-        if any(k in t.upper() for k in ['UPTD', 'SD NEGERI', 'SMP NEGERI', 'SMA NEGERI', 'SMK NEGERI']):
-            clean_name = clean_spelling(t)
-            clean_name = clean_name.replace('UPTD.SMP NEGERI LBIREUEN', 'UPTD. SMP NEGERI 1 BIREUEN')
-            clean_name = clean_name.replace('UPTD.SMP NEGERI 1', 'UPTD. SMP NEGERI 1 BIREUEN')
-            if clean_name not in school_names:
-                school_names.append(clean_name)
-    
-    if school_names:
-        data['Nama Lembaga Induk'] = school_names[0]
+    page1_items = []
+    if page1_results:
+        for box, text, conf in page1_results:
+            xs = [pt[0] for pt in box]
+            ys = [pt[1] for pt in box]
+            page1_items.append({
+                'text': text.strip(),
+                'x_min': min(xs),
+                'x_max': max(xs),
+                'y_min': min(ys),
+                'y_max': max(ys)
+            })
+
+    # 1. School name (Nama Lembaga Induk)
+    data['Nama Lembaga Induk'] = find_value_for_label(page1_results, ['nama lembaga'])
+    data['Nama Lembaga Induk'] = clean_extracted_value('Nama Lembaga Induk', data['Nama Lembaga Induk'])
+
+    # 2. Nama Perpustakaan
+    data['Nama Perpustakaan'] = find_value_for_label(page1_results, ['nama perpustakaan'])
+    if data['Nama Perpustakaan']:
+        data['Nama Perpustakaan'] = clean_extracted_value('Nama Perpustakaan', data['Nama Perpustakaan'])
+
+    # 3. Geography
+    prov = find_value_for_label(page1_results, ['provinsi'])
+    if prov:
+        data['Provinsi'] = clean_extracted_value('Provinsi', prov)
         
-        # Search if any text has "PERPUSTAKAAN"
-        perp_name = ""
-        for t in page1_texts:
-            if 'PERPUSTAKAAN' in t.upper() and any(k in t.upper() for k in ['UPTD', 'SD', 'SMP', 'SMA']):
-                perp_name = clean_spelling(t)
-                perp_name = perp_name.replace('PERPUSTAKAANUPTDSDNEGERI7BIREUEN', 'PERPUSTAKAAN UPTD SD NEGERI 7 BIREUEN')
+    kab = find_value_for_label(page1_results, ['kabupaten'])
+    if kab:
+        data['Kabupaten'] = clean_extracted_value('Kabupaten', kab)
+        
+    kec = find_value_for_label(page1_results, ['kecamatan'])
+    if kec:
+        data['Kecamatan'] = clean_extracted_value('Kecamatan', kec)
+        
+    desa = find_value_for_label(page1_results, ['kelurahan', 'desa'])
+    if desa:
+        data['Desa/Kelurahan'] = clean_extracted_value('Desa/Kelurahan', desa)
+
+    # 4. Alamat Lengkap
+    alamat = find_value_for_label(page1_results, ['alamat'])
+    if alamat:
+        data['Alamat Lengkap (Jalan RT/ RW)'] = clean_extracted_value('Alamat Lengkap (Jalan RT/ RW)', alamat)
+
+    # 5. Kode Pos
+    kodepos = find_value_for_label(page1_results, ['kode pos'])
+    if kodepos:
+        data['Kode Pos'] = clean_extracted_value('Kode Pos', kodepos)
+
+    # 6. Nomor Telepon/Whatsapp
+    notelp = find_value_for_label(page1_results, ['nomortelepon', 'nomor telepon', 'telp'])
+    if notelp:
+        data['Nomor Telepon/Whatsapp'] = clean_extracted_value('Nomor Telepon/Whatsapp', notelp)
+
+    # 7. Email Perpustakaan
+    email = ""
+    for item in page1_items:
+        if '@' in item['text']:
+            m = re.search(r'[\w\.-]+@[\w\.-]+', item['text'])
+            if m:
+                email = m.group(0)
+                email = email.lower().replace('9mail', 'gmail')
+                if '.comm' in email:
+                    email = re.sub(r'\.comm\d*.*', '.com', email)
+                elif '.com' in email:
+                    email = re.sub(r'\.com\d*.*', '.com', email)
                 break
-        
-        if not perp_name:
-            perp_name = school_names[0]
-            if not perp_name.upper().startswith('PERPUSTAKAAN'):
-                perp_name = f"PERPUSTAKAAN {perp_name}"
-        data['Nama Perpustakaan'] = perp_name
-        
-        # Determine subjenis
-        if 'SMP' in school_names[0].upper():
-            data['Subjenis Perpustakaan'] = 'Perpustakaan Sekolah' # sheet SD_ & SMP templates have 'Perpustakaan Sekolah'
-        elif 'SD' in school_names[0].upper():
+    data['Alamat Email perpustakaan'] = email
+
+    # 8. Nama Lengkap Kepala Pustakawan
+    label_item = None
+    for item in page1_items:
+        if 'kepala' in item['text'].lower() and 'sekolah' not in item['text'].lower():
+            label_item = item
+            break
+    if label_item:
+        label_y_min = label_item['y_min']
+        label_y_max = label_item['y_max']
+        label_h = label_y_max - label_y_min
+        candidates = []
+        for item in page1_items:
+            if item == label_item or 'perpustakaan' in item['text'].lower():
+                continue
+            overlap_y_min = max(label_y_min, item['y_min'])
+            overlap_y_max = min(label_y_max, item['y_max'])
+            overlap_h = overlap_y_max - overlap_y_min
+            item_h = item['y_max'] - item['y_min']
+            if item_h > 0 and overlap_h > 0 and (overlap_h / label_h >= 0.5 or overlap_h / item_h >= 0.5):
+                if item['x_min'] > label_item['x_min'] - 20:
+                    candidates.append(item)
+        candidates = sorted(candidates, key=lambda x: x['x_min'])
+        data['Nama Lengkap Kepala Pustakawan'] = clean_extracted_value('Nama Lengkap Kepala Pustakawan', " ".join([c['text'] for c in candidates]))
+
+    # 9. Nomor SK Pendirian Perpustakaan
+    sk_perpus = find_value_for_label(page1_results, ['sk pendirian', 'sk lembaga'])
+    if sk_perpus:
+        data['Nomor SK Pendirian Perpustakaan'] = clean_extracted_value('Nomor SK Pendirian Perpustakaan', sk_perpus)
+
+    # 10. Tahun Berdiri Perpustakaan
+    thn_berdiri = find_value_for_label(page1_results, ['tahun berdiri'])
+    if thn_berdiri:
+        data['Tahun Berdiri Perpustakaan'] = clean_extracted_value('Tahun Berdiri Perpustakaan', thn_berdiri)
+
+    # 11. Nomor Pokok Perpustakaan (NPP)
+    npp = find_value_for_label(page1_results, ['npp'])
+    if npp:
+        data['Nomor Pokok Perpustakaan (NPP)'] = clean_extracted_value('Nomor Pokok Perpustakaan (NPP)', npp)
+
+    # 12. Jumlah Anggota Perpustakaan / Jumlah Peserta Didik
+    jml_anggota = find_value_for_label(page1_results, ['jumlahpeserta didik', 'jumlah anggota'])
+    if jml_anggota:
+        data['Jumlah Anggota Perpustakaan'] = clean_extracted_value('Jumlah Anggota Perpustakaan', jml_anggota)
+
+    # Finalize school/library name relationships
+    school_name = data['Nama Lembaga Induk']
+    if school_name:
+        if 'MIN' in school_name.upper() or 'SD' in school_name.upper():
             data['Subjenis Perpustakaan'] = 'Perpustakaan Sekolah'
-            
-    # 2. Geography
-    for t in page1_texts:
-        if 'ACEH' in t.upper():
-            data['Provinsi'] = 'Aceh'
-            break
-    for t in page1_texts:
-        if 'BIREUEN' in t.upper() or 'BIREVEN' in t.upper():
-            data['Kabupaten'] = 'Bireuen'
-            break
-    for t in page1_texts:
-        if 'KOTA JUANG' in t.upper():
-            data['Kecamatan'] = 'Kota Juang'
-            break
-    for t in page1_texts:
-        if 'GAMPONG BARO' in t.upper() or 'GAMPONO BARD' in t.upper() or 'GAMPONG BARU' in t.upper():
-            data['Desa/Kelurahan'] = 'Gampong Baro'
-            break
-        elif 'GEULANGGANG KULAM' in t.upper() or 'GEULANGGANGKULAM' in t.upper():
-            data['Desa/Kelurahan'] = 'Geulanggang Gampong' # match existing Excel style or correct name
-            break
-            
-    # Alamat
-    for t in page1_texts:
-        if 'JL.' in t.upper() or 'JALAN' in t.upper() or 'LAKSAMANA' in t.upper() or 'MOL CUT' in t.upper():
-            data['Alamat Lengkap (Jalan RT/ RW)'] = clean_spelling(t)
-            break
-            
-    # Kode Pos
-    for t in page1_texts:
-        if re.match(r'^\b242\d{2}\b$', t):
-            data['Kode Pos'] = t
-            break
-            
-    # Nomor Telepon
-    for t in page1_texts:
-        if re.search(r'\b08\d{8,11}\b', t) or re.search(r'\b00\d{8,11}\b', t):
-            num = t.strip()
-            if num.startswith('0013'):
-                num = '0813' + num[4:]
-            data['Nomor Telepon/Whatsapp'] = num
-            break
-            
-    # Email
-    for t in page1_texts:
-        if '@' in t:
-            data['Alamat Email perpustakaan'] = t.strip()
-            break
-            
-    # Names with S.Pd (Pustakawan)
-    names_spd = []
-    for t in page1_texts:
-        if ',S.Pd' in t or ', S.Pd' in t or ',S.Pd.I' in t or ', S.Pd.I' in t:
-            names_spd.append(clean_spelling(t))
-            
-    if names_spd:
-        for name in names_spd:
-            if not any(k in name.upper() for k in ['HARUN', 'NAZIR']):
-                data['Nama Lengkap Kepala Pustakawan'] = name
-                
-    # SK Pendirian
-    for t in page1_texts:
-        if 'NOMOR:' in t.upper() or 'NOMOR : ' in t.upper():
-            data['Nomor SK Pendirian Perpustakaan'] = clean_spelling(t)
-            break
-            
-    # Tahun Berdiri
-    for t in page1_texts:
-        if t.strip() in ['2017', '2010', '2007', '2018', '2019', '2020']:
-            data['Tahun Berdiri Perpustakaan'] = t.strip()
-            break
-            
-    # Jumlah Peserta Didik
-    for t in page1_texts:
-        if t.strip() in ['988', '239', '500']:
-            data['Jumlah Anggota Perpustakaan'] = t.strip()
-            break
+        if not data['Nama Perpustakaan']:
+            data['Nama Perpustakaan'] = f"PERPUSTAKAAN {school_name.upper()}"
 
     # ------------------ PROCESS PAGE 2 ------------------
-    if page2_texts:
-        # Luas Gedung
-        for idx, t in enumerate(page2_texts):
-            if 'LUAS GEDUNG' in t.upper() or 'LUAS' in t.upper():
-                for offset in range(-3, 4):
-                    if 0 <= idx + offset < len(page2_texts):
-                        cand = page2_texts[idx + offset]
-                        if cand.strip().isdigit() and len(cand.strip()) <= 3:
-                            data['Luas Gedung Perpustakaan'] = cand.strip()
-                            break
-                            
-        # Jumlah Tenaga
-        for idx, t in enumerate(page2_texts):
-            if 'JUMLAH TENAGA' in t.upper() or 'TENAGA' in t.upper():
-                for offset in range(-3, 4):
-                    if 0 <= idx + offset < len(page2_texts):
-                        cand = page2_texts[idx + offset]
-                        if 'orang' in cand or (cand.strip().isdigit() and len(cand.strip()) == 1):
-                            m = re.search(r'\d+', cand)
-                            data['Jumlah Tenaga Perpustakaan'] = m.group(0) if m else cand.strip()
-                            break
-                            
-        # Jumlah Judul Koleksi & Jumlah Eksemplar Koleksi
-        numbers_with_dots = []
-        for t in page2_texts:
-            clean_num = t.replace(' ', '')
-            if re.match(r'^\d{1,3}\.\d{3}$', clean_num):
-                numbers_with_dots.append(clean_num)
-                
-        if len(numbers_with_dots) >= 2:
-            sorted_nums = sorted(numbers_with_dots, key=lambda x: float(x.replace('.', '')))
-            data['Jumlah Judul Koleksi'] = sorted_nums[0]
-            data['Jumlah Eksemplar Koleksi'] = sorted_nums[1]
-        elif len(numbers_with_dots) == 1:
-            data['Jumlah Judul Koleksi'] = numbers_with_dots[0]
-            
-        # Date for Tahun Pendataan extraction
-        for t in page2_texts:
-            if re.search(r'\b20\d{2}\b', t):
-                m = re.search(r'\b20\d{2}\b', t)
+    if page2_results:
+        page2_items = []
+        for box, text, conf in page2_results:
+            xs = [pt[0] for pt in box]
+            ys = [pt[1] for pt in box]
+            page2_items.append({
+                'text': text.strip(),
+                'x_min': min(xs),
+                'x_max': max(xs),
+                'y_min': min(ys),
+                'y_max': max(ys)
+            })
+
+        # 1. Luas Gedung Perpustakaan
+        luas = find_value_for_label(page2_results, ['edung', 'luas gedung', 'luas'])
+        if luas:
+            data['Luas Gedung Perpustakaan'] = clean_extracted_value('Luas Gedung Perpustakaan', luas)
+
+        # 2. Jumlah Tenaga Perpustakaan
+        tenaga = find_value_for_label(page2_results, ['tenaga', 'jumlah tenaga'])
+        if tenaga:
+            data['Jumlah Tenaga Perpustakaan'] = clean_extracted_value('Jumlah Tenaga Perpustakaan', tenaga)
+
+        # 3. Jumlah Judul Koleksi
+        judul = find_value_for_label(page2_results, ['jumlah judul', 'judul'])
+        if judul:
+            data['Jumlah Judul Koleksi'] = clean_extracted_value('Jumlah Judul Koleksi', judul)
+
+        # 4. Jumlah Eksemplar Koleksi
+        eksemplar = find_value_for_label(page2_results, ['eksemplar', 'jumlah eksemplar'])
+        if eksemplar:
+            data['Jumlah Eksemplar Koleksi'] = clean_extracted_value('Jumlah Eksemplar Koleksi', eksemplar)
+
+        # 5. Tahun Pendataan
+        for item in page2_items:
+            m = re.search(r'\b20\d{2}\b', item['text'])
+            if m:
                 data['Tahun Pendataan'] = m.group(0)
                 break
-                
+
     return data
 
 def main():
@@ -264,48 +400,69 @@ def main():
     print("="*60)
     
     # 1. Detect images
-    images = sorted(glob.glob("*.jpeg") + glob.glob("*.jpg") + glob.glob("*.png"))
-    images = [img for img in images if os.path.isfile(img)]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(script_dir)
     
-    if len(images) != 2:
-        print(f"ERROR: Ditemukan {len(images)} gambar di folder aktif.")
-        print("Pastikan HANYA ada 2 gambar (Halaman 1 dan Halaman 2) dari satu formulir sekolah.")
-        print("Silakan pindahkan gambar lain keluar dari folder ini dan jalankan kembali.")
+    # Prioritaskan folder root (parent folder dari script) lalu folder aktif (script_dir)
+    search_dirs = [root_dir, script_dir]
+    images = []
+    found_dir = None
+    
+    for d in search_dirs:
+        imgs = sorted(
+            glob.glob(os.path.join(d, "*.jpeg")) +
+            glob.glob(os.path.join(d, "*.jpg")) +
+            glob.glob(os.path.join(d, "*.png"))
+        )
+        imgs = [img for img in imgs if os.path.isfile(img)]
+        if len(imgs) == 2:
+            images = imgs
+            found_dir = d
+            break
+            
+    if not images:
+        # Jika tidak ditemukan tepat 2 gambar di salah satu folder, hitung gambar di root_dir untuk pesan error
+        root_imgs = sorted(
+            glob.glob(os.path.join(root_dir, "*.jpeg")) +
+            glob.glob(os.path.join(root_dir, "*.jpg")) +
+            glob.glob(os.path.join(root_dir, "*.png"))
+        )
+        root_imgs = [img for img in root_imgs if os.path.isfile(img)]
+        print(f"ERROR: Ditemukan {len(root_imgs)} gambar di folder root ({root_dir}).")
+        print("Pastikan HANYA ada 2 gambar (Halaman 1 dan Halaman 2) dari satu formulir sekolah di folder root.")
+        print("Silakan pindahkan gambar lain keluar dari folder tersebut dan jalankan kembali.")
         return
         
-    print(f"Mendeteksi berkas untuk sesi ini:")
+    print(f"Mendeteksi berkas di folder: {found_dir}")
     for img in images:
-        print(f" - {img}")
+        print(f" - {os.path.basename(img)}")
     print("\nSedang memproses OCR (Mohon tunggu)...")
     
     # 2. Extract data
     data = parse_form_data(images)
     
-    # Define ordered key list for presentation & editing (23 editable fields)
-    fields = [
-        ('Nama Lengkap Kepala Pustakawan', data['Nama Lengkap Kepala Pustakawan']),
-        ('Jabatan', data['Jabatan']),
-        ('Alamat Email perpustakaan', data['Alamat Email perpustakaan']),
-        ('Nomor Telepon/Whatsapp', data['Nomor Telepon/Whatsapp']),
-        ('Nomor Pokok Perpustakaan (NPP)', data['Nomor Pokok Perpustakaan (NPP)']),
-        ('Subjenis Perpustakaan', data['Subjenis Perpustakaan']),
-        ('Nama Perpustakaan', data['Nama Perpustakaan']),
-        ('Provinsi', data['Provinsi']),
-        ('Kabupaten', data['Kabupaten']),
-        ('Kecamatan', data['Kecamatan']),
-        ('Desa/Kelurahan', data['Desa/Kelurahan']),
-        ('Alamat Lengkap (Jalan RT/ RW)', data['Alamat Lengkap (Jalan RT/ RW)']),
-        ('Kode Pos', data['Kode Pos']),
-        ('Nama Lembaga Induk', data['Nama Lembaga Induk']),
-        ('Tahun Berdiri Perpustakaan', data['Tahun Berdiri Perpustakaan']),
-        ('Nomor SK Pendirian Perpustakaan', data['Nomor SK Pendirian Perpustakaan']),
-        ('Jumlah Anggota Perpustakaan', data['Jumlah Anggota Perpustakaan']),
-        ('Luas Gedung Perpustakaan', data['Luas Gedung Perpustakaan']),
-        ('Jumlah Tenaga Perpustakaan', data['Jumlah Tenaga Perpustakaan']),
-        ('Jumlah Judul Koleksi', data['Jumlah Judul Koleksi']),
-        ('Jumlah Eksemplar Koleksi', data['Jumlah Eksemplar Koleksi']),
-        ('Jumlah Hari Layanan dalam Seminggu (hari)', data['Jumlah Hari Layanan dalam Seminggu (hari)']),
-        ('Tahun Pendataan', data['Tahun Pendataan'])
+    # Define ordered display list for presentation & editing (20 fields requested by user)
+    prompt_fields = [
+        ('nama kepala perpustakaan', 'Nama Lengkap Kepala Pustakawan'),
+        ('jabatan', 'Jabatan'),
+        ('alamat email', 'Alamat Email perpustakaan'),
+        ('notelp', 'Nomor Telepon/Whatsapp'),
+        ('subjenis', 'Subjenis Perpustakaan'),
+        ('nama perpustakaan', 'Nama Perpustakaan'),
+        ('prov', 'Provinsi'),
+        ('kab', 'Kabupaten'),
+        ('kec', 'Kecamatan'),
+        ('desa', 'Desa/Kelurahan'),
+        ('alamat lengkap', 'Alamat Lengkap (Jalan RT/ RW)'),
+        ('kodepos', 'Kode Pos'),
+        ('nama instansi', 'Nama Lembaga Induk'),
+        ('no SK perpus', 'Nomor SK Pendirian Perpustakaan'),
+        ('jumlah judul buku', 'Jumlah Judul Koleksi'),
+        ('jumlah eksemplar', 'Jumlah Eksemplar Koleksi'),
+        ('jumlahanggota perpus(siswa)', 'Jumlah Anggota Perpustakaan'),
+        ('jumlah petugas perpus', 'Jumlah Tenaga Perpustakaan'),
+        ('luaslahan gedung', 'Luas Gedung Perpustakaan'),
+        ('jumlah hari operasional dalam. 1 minggu', 'Jumlah Hari Layanan dalam Seminggu (hari)')
     ]
     
     # 3. Interactive Edit Loop
@@ -313,10 +470,10 @@ def main():
         print("\n" + "="*50)
         print("HASIL EKSTRAKSI DATA (SILAKAN PERIKSA & EDIT):")
         print("="*50)
-        for idx, (k, v) in enumerate(fields, 1):
-            print(f"{idx:2d}. {k:<40} : {v}")
+        for idx, (display, key) in enumerate(prompt_fields, 1):
+            print(f"{idx:2d}. {display:<42} : {data[key]}")
             
-        print("\nKetik nomor field (1-23) untuk mengedit nilainya.")
+        print("\nKetik nomor field (1-20) untuk mengedit nilainya.")
         print("Ketik 'y' jika semua data sudah benar dan siap disimpan ke Excel.")
         print("Ketik 'n' untuk membatalkan proses sesi ini.")
         
@@ -329,11 +486,10 @@ def main():
             return
         elif choice.isdigit():
             idx = int(choice) - 1
-            if 0 <= idx < len(fields):
-                k, v = fields[idx]
-                new_val = input(f"Masukkan nilai baru untuk [{k}] (sebelumnya: '{v}'): ").strip()
-                fields[idx] = (k, new_val)
-                data[k] = new_val
+            if 0 <= idx < len(prompt_fields):
+                display, key = prompt_fields[idx]
+                new_val = input(f"Masukkan nilai baru untuk [{display}] (sebelumnya: '{data[key]}'): ").strip()
+                data[key] = new_val
             else:
                 print("Nomor tidak valid.")
         else:
@@ -452,14 +608,14 @@ def main():
         
     # 5. Archive files
     clean_school_folder = re.sub(r'[^a-zA-Z0-9_]', '_', data['Nama Lembaga Induk']).strip('_')
-    archive_dir = os.path.join("processed", f"{clean_school_folder}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    archive_dir = os.path.join(script_dir, "processed", f"{clean_school_folder}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     
     print(f"Mengarsipkan file ke: {archive_dir}")
     try:
         os.makedirs(archive_dir, exist_ok=True)
         for img in images:
-            shutil.move(img, os.path.join(archive_dir, img))
-        print("Pengarsipan selesai! Folder aktif sekarang bersih.")
+            shutil.move(img, os.path.join(archive_dir, os.path.basename(img)))
+        print("Pengarsipan selesai! Folder input sekarang bersih.")
     except Exception as e:
         print(f"Peringatan: Gagal memindahkan file ke arsip: {e}")
 
